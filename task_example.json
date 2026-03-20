@@ -1,0 +1,10 @@
+{
+  "task": "Build a command-line todo app in Python",
+  "objectives": [
+    "Create todo.py with a Todo dataclass (id, title, done, created_at)",
+    "Implement add_todo, list_todos, complete_todo, delete_todo functions using a JSON file for storage",
+    "Add a CLI with argparse: add, list, done, delete subcommands",
+    "Write a pytest test suite covering all CRUD operations",
+    "Add a README.md with usage examples"
+  ]
+}
