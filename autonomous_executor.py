@@ -10,8 +10,8 @@ Features
 * Persistent state (executor_state.json) – survives crashes / manual restarts.
 * Context-window exhaustion detection – starts a fresh Claude Code session
   (with summarised history in the prompt) so work continues uninterrupted.
-* Rate-limit detection – reads the reset timestamp from the RateLimitEvent
-  and sleeps until the limit clears, then resumes the same session.
+* Rate-limit detection – catches 429 / rate-limit errors and sleeps with
+  exponential backoff before resuming the same session.
 * Planner LLM – a separate Anthropic API call produces each focused prompt
   and evaluates which objectives were completed after each session.
 
@@ -35,27 +35,31 @@ Usage
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import anthropic
 import anyio
+
+# Allow spawning Claude Code subprocesses even when this script is itself
+# launched from inside a Claude Code session.
+os.environ.pop("CLAUDECODE", None)
 from claude_agent_sdk import (
     CLIConnectionError,
+    CLIJSONDecodeError,
     CLINotFoundError,
     ClaudeAgentOptions,
-    RateLimitEvent,
     ResultMessage,
     SystemMessage,
     query,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Constants
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 STATE_FILE = Path("executor_state.json")
 DEFAULT_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -74,10 +78,18 @@ CONTEXT_LIMIT_KEYWORDS = (
     "input too long",
 )
 
+# Error substrings that indicate a rate-limit (back off and retry same session).
+RATE_LIMIT_KEYWORDS = ("rate_limit", "rate limit", "429", "too many requests")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# How long to sleep when a rate limit is detected (seconds, doubles each retry).
+RATE_LIMIT_BASE_SLEEP = 60
+
+
+
+
+# -----------------------------------------------------------------------------
 # State helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -89,12 +101,32 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Planner (uses Anthropic API directly)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Planner helpers – use Claude Code's own auth via query() (no tools, 1 turn)
+# -----------------------------------------------------------------------------
+
+async def _planner_query(prompt: str) -> str:
+    """
+    Run a single-turn, tool-free Claude query using the Claude Code CLI auth.
+    Returns the text of the ResultMessage, or an empty string on failure.
+
+    Important: we must drain the entire async generator (no early return) to
+    avoid leaving a dangling anyio cancel scope that would cancel the next
+    subprocess spawn.  Failures are caught and logged; callers fall back to
+    safe defaults.
+    """
+    opts = ClaudeAgentOptions(allowed_tools=[], max_turns=1)
+    result = ""
+    try:
+        async for msg in query(prompt=prompt, options=opts):
+            if isinstance(msg, ResultMessage) and msg.result:
+                result = msg.result.strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [planner] query failed ({exc}); using fallback.")
+    return result
+
 
 async def plan_next_prompt(
-    client: anthropic.AsyncAnthropic,
     task: str,
     objectives: list[str],
     completed: list[str],
@@ -103,46 +135,31 @@ async def plan_next_prompt(
     """Generate a focused, actionable prompt for the next Claude Code session."""
     remaining = [o for o in objectives if o not in completed]
     history_block = (
-        "\n".join(f"  • {h}" for h in history[-10:])
+        "\n".join(f"  - {h}" for h in history[-10:])
         if history
         else "  (none yet)"
     )
 
-    response = await client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=1024,
-        thinking={"type": "adaptive"},
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "You are orchestrating an autonomous coding assistant.\n\n"
-                    f"Overall task:\n  {task}\n\n"
-                    "Remaining objectives (in order):\n"
-                    + "\n".join(f"  {i+1}. {o}" for i, o in enumerate(remaining))
-                    + f"\n\nPrevious sessions:\n{history_block}\n\n"
-                    "Write a concise, actionable prompt for the coding assistant to work on "
-                    "the next 1–2 remaining objectives. Be specific. "
-                    "At the end of the prompt, ask the assistant to summarise what it accomplished.\n\n"
-                    "Reply with ONLY the prompt text, no preamble or explanation."
-                ),
-            }
-        ],
+    planner_prompt = (
+        "You are orchestrating an autonomous coding assistant.\n\n"
+        f"Overall task:\n  {task}\n\n"
+        "Remaining objectives (in order):\n"
+        + "\n".join(f"  {i+1}. {o}" for i, o in enumerate(remaining))
+        + f"\n\nPrevious sessions:\n{history_block}\n\n"
+        "Write a concise, actionable prompt for the coding assistant to work on "
+        "the next 1-2 remaining objectives. Be specific. "
+        "At the end of the prompt, ask the assistant to summarise what it accomplished.\n\n"
+        "Reply with ONLY the prompt text, no preamble or explanation."
     )
 
-    for block in response.content:
-        if block.type == "text":
-            return block.text.strip()
-
-    return (
-        f"Work on the following for the task '{task}': "
-        + (remaining[0] if remaining else "review overall progress")
-        + ". Summarise what you accomplished at the end."
+    result = await _planner_query(planner_prompt)
+    return result or (
+        f"Work on: {remaining[0] if remaining else task}. "
+        "Summarise what you accomplished at the end."
     )
 
 
 async def evaluate_progress(
-    client: anthropic.AsyncAnthropic,
     task: str,
     objectives: list[str],
     completed: list[str],
@@ -154,49 +171,39 @@ async def evaluate_progress(
     """
     snippet = session_output[-3000:] if len(session_output) > 3000 else session_output
 
-    response = await client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=512,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Task: {task}\n\n"
-                    "All objectives:\n"
-                    + "\n".join(f"  - {o}" for o in objectives)
-                    + "\n\nAlready confirmed complete:\n"
-                    + (
-                        "\n".join(f"  - {o}" for o in completed)
-                        if completed
-                        else "  (none)"
-                    )
-                    + f"\n\nLatest assistant output:\n{snippet}\n\n"
-                    "Which objectives from 'All objectives' are NOW complete? "
-                    "Include previously completed ones. "
-                    "Only mark something complete if there is clear evidence it was done. "
-                    "Reply with ONLY a JSON array of the exact objective strings."
-                ),
-            }
-        ],
+    planner_prompt = (
+        f"Task: {task}\n\n"
+        "All objectives:\n"
+        + "\n".join(f"  - {o}" for o in objectives)
+        + "\n\nAlready confirmed complete:\n"
+        + (
+            "\n".join(f"  - {o}" for o in completed)
+            if completed
+            else "  (none)"
+        )
+        + f"\n\nLatest assistant output:\n{snippet}\n\n"
+        "Which objectives from 'All objectives' are NOW complete? "
+        "Include previously completed ones. "
+        "Only mark something complete if there is clear evidence it was done. "
+        "Reply with ONLY a JSON array of the exact objective strings, nothing else."
     )
 
-    for block in response.content:
-        if block.type == "text":
-            m = re.search(r"\[.*?\]", block.text, re.DOTALL)
-            if m:
-                try:
-                    result = json.loads(m.group())
-                    # Only return items that are known objectives.
-                    return [o for o in result if o in objectives]
-                except json.JSONDecodeError:
-                    pass
+    result = await _planner_query(planner_prompt)
+    if result:
+        m = re.search(r"\[.*?\]", result, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+                return [o for o in parsed if o in objectives]
+            except json.JSONDecodeError:
+                pass
 
     return completed  # Safe fallback: keep what was already done.
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Claude Code session runner
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def run_claude_session(
     prompt: str,
@@ -217,7 +224,7 @@ async def run_claude_session(
     output_parts: list[str] = []
     session_id: Optional[str] = resume_id
     context_exhausted = False
-    rate_limit_reset: Optional[str] = None
+    rate_limited = False
 
     # Build options.  When resuming we pass only `resume`; the existing session
     # already carries cwd, tool list, etc.  For a fresh start we supply all opts.
@@ -246,17 +253,7 @@ async def run_claude_session(
                           "(context / turn limit reached)")
                     context_exhausted = True
 
-            elif isinstance(msg, RateLimitEvent):
-                info = msg.rate_limit_info
-                print(f"  [!] Rate limit event: status={info.status!r}")
-                if info.status == "rejected" and info.resets_at:
-                    rate_limit_reset = (
-                        info.resets_at.isoformat()
-                        if hasattr(info.resets_at, "isoformat")
-                        else str(info.resets_at)
-                    )
-
-    except (CLINotFoundError, CLIConnectionError) as exc:
+    except (CLINotFoundError, CLIConnectionError, CLIJSONDecodeError) as exc:
         print(f"  [!] CLI error: {exc}")
         output_parts.append(f"[CLI error: {exc}]")
 
@@ -264,16 +261,19 @@ async def run_claude_session(
         err_lower = str(exc).lower()
         print(f"  [!] Session error: {exc}")
         output_parts.append(f"[Error: {exc}]")
-        if any(kw in err_lower for kw in CONTEXT_LIMIT_KEYWORDS):
+        if any(kw in err_lower for kw in RATE_LIMIT_KEYWORDS):
+            print("  [!] Rate-limit detected in error.")
+            rate_limited = True
+        elif any(kw in err_lower for kw in CONTEXT_LIMIT_KEYWORDS):
             print("  [!] Context-limit keyword detected in error.")
             context_exhausted = True
 
-    return "\n".join(output_parts), session_id, context_exhausted, rate_limit_reset
+    return "\n".join(output_parts), session_id, context_exhausted, rate_limited
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main execution loop
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 async def run(
     task: str,
@@ -283,9 +283,8 @@ async def run(
 ) -> None:
     """Drive Claude Code in a loop until all objectives are met."""
     tools = tools or DEFAULT_TOOLS
-    planner = anthropic.AsyncAnthropic()
 
-    # ── Load / initialise state ──────────────────────────────────────────────
+    # -- Load / initialise state ----------------------------------------------
     state = load_state()
 
     if state.get("task") != task:
@@ -303,83 +302,90 @@ async def run(
 
     save_state(state)
 
-    # ── Main loop ────────────────────────────────────────────────────────────
+    # -- Main loop ------------------------------------------------------------
     while True:
         completed: list[str] = state.get("completed_objectives", [])
         remaining = [o for o in objectives if o not in completed]
 
-        # ── Check for completion ─────────────────────────────────────────────
+        # -- Check for completion ---------------------------------------------
         if not remaining:
-            print("\n" + "═" * 60)
-            print("  ✓ All objectives completed!")
-            print("═" * 60)
+            print("\n" + "=" * 60)
+            print("  v All objectives completed!")
+            print("=" * 60)
             state["completed_at"] = datetime.now(timezone.utc).isoformat()
             state.pop("session_id", None)
             save_state(state)
             break
 
-        # ── Honour any pending rate-limit wait ───────────────────────────────
-        rl_reset = state.pop("rate_limit_resets_at", None)
-        if rl_reset:
+        # -- Honour any pending rate-limit back-off ---------------------------
+        rl_sleep = state.pop("rate_limit_sleep_until", None)
+        if rl_sleep:
             try:
-                reset_dt = datetime.fromisoformat(rl_reset)
-                if reset_dt.tzinfo is None:
-                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
-                wait_secs = (reset_dt - datetime.now(timezone.utc)).total_seconds() + 5
+                until_dt = datetime.fromisoformat(rl_sleep)
+                if until_dt.tzinfo is None:
+                    until_dt = until_dt.replace(tzinfo=timezone.utc)
+                wait_secs = (until_dt - datetime.now(timezone.utc)).total_seconds()
                 if wait_secs > 0:
-                    print(f"\n⏳  Rate limited — sleeping {wait_secs:.0f}s (until {rl_reset})")
+                    print(f"\n~  Rate limited — sleeping {wait_secs:.0f}s")
                     await asyncio.sleep(wait_secs)
             except (ValueError, TypeError):
                 pass
             save_state(state)
 
-        # ── Session header ───────────────────────────────────────────────────
+        # -- Session header ---------------------------------------------------
         session_num = len(state.get("history", [])) + 1
-        print(f"\n{'─' * 60}")
+        print(f"\n{'-' * 60}")
         print(f"  Session #{session_num}  |  {len(completed)}/{len(objectives)} objectives done")
         print(f"  Remaining: {remaining}")
-        print(f"{'─' * 60}")
+        print(f"{'-' * 60}")
 
-        # ── Plan the next prompt ─────────────────────────────────────────────
+        # -- Plan the next prompt ---------------------------------------------
         prompt = await plan_next_prompt(
-            planner, task, objectives, completed, state.get("history", [])
+            task, objectives, completed, state.get("history", [])
         )
         print(f"\n[Prompt → Claude Code]\n{prompt}\n")
 
-        # ── Run Claude Code ──────────────────────────────────────────────────
+        # -- Run Claude Code --------------------------------------------------
         resume_id: Optional[str] = state.get("session_id")
 
-        output, new_session_id, context_exhausted, rl_time = await run_claude_session(
+        output, new_session_id, context_exhausted, rate_limited = await run_claude_session(
             prompt=prompt,
             cwd=cwd,
             resume_id=resume_id,
             tools=tools,
         )
 
-        # ── Handle context exhaustion (start fresh next turn) ────────────────
+        # -- Handle context exhaustion (start fresh next turn) ----------------
         if context_exhausted:
             print(
-                "\n⚠  Context window exhausted — dropping session ID. "
+                "\n!  Context window exhausted — dropping session ID. "
                 "Next session will start fresh with history-aware prompt."
             )
             state.pop("session_id", None)
         elif new_session_id:
             state["session_id"] = new_session_id
 
-        # ── Handle rate limit (sleep next iteration) ─────────────────────────
-        if rl_time:
-            print(f"\n⚠  Rate limit active — will wait until {rl_time}")
-            state["rate_limit_resets_at"] = rl_time
+        # -- Handle rate limit (exponential back-off, keep same session) ------
+        if rate_limited:
+            rl_attempt = state.get("rate_limit_attempt", 0) + 1
+            sleep_secs = min(RATE_LIMIT_BASE_SLEEP * (2 ** (rl_attempt - 1)), 3600)
+            wake_at = datetime.now(timezone.utc).timestamp() + sleep_secs
+            wake_iso = datetime.fromtimestamp(wake_at, tz=timezone.utc).isoformat()
+            print(f"\n!  Rate limit — back off {sleep_secs:.0f}s (attempt {rl_attempt})")
+            state["rate_limit_sleep_until"] = wake_iso
+            state["rate_limit_attempt"] = rl_attempt
+        else:
+            state.pop("rate_limit_attempt", None)
 
-        # ── Evaluate which objectives are now done ───────────────────────────
+        # -- Evaluate which objectives are now done ---------------------------
         if output.strip():
             prev_count = len(completed)
-            updated = await evaluate_progress(planner, task, objectives, completed, output)
+            updated = await evaluate_progress(task, objectives, completed, output)
             state["completed_objectives"] = updated
             newly_done = [o for o in updated if o not in completed]
 
             if newly_done:
-                print(f"\n✓  Newly completed ({len(newly_done)}): {newly_done}")
+                print(f"\nv  Newly completed ({len(newly_done)}): {newly_done}")
             else:
                 print("\n  No new objectives completed this session.")
                 # Brief back-off if stuck.
@@ -388,10 +394,10 @@ async def run(
             print("\n  (No output from session.)")
             await asyncio.sleep(8)
 
-        # ── Update history ───────────────────────────────────────────────────
+        # -- Update history ---------------------------------------------------
         completed_now = state.get("completed_objectives", [])
         state.setdefault("history", []).append(
-            f"Session {session_num}: {prompt[:100]}… "
+            f"Session {session_num}: {prompt[:100]}... "
             f"[{len(completed_now)}/{len(objectives)} done]"
         )
         save_state(state)
@@ -399,9 +405,9 @@ async def run(
         await asyncio.sleep(1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -467,7 +473,7 @@ python autonomous_executor.py
 async def async_main() -> None:
     args = build_parser().parse_args()
 
-    # ── Determine task & objectives ──────────────────────────────────────────
+    # -- Determine task & objectives ------------------------------------------
     if args.resume:
         state = load_state()
         if not state:
@@ -487,9 +493,9 @@ async def async_main() -> None:
 
     else:
         # Interactive mode
-        print("═" * 55)
+        print("=" * 55)
         print("  Autonomous Task Executor for Claude Code")
-        print("═" * 55)
+        print("=" * 55)
         task = input("\nTask description: ").strip()
         if not task:
             print("No task provided.")
@@ -508,7 +514,7 @@ async def async_main() -> None:
     cwd = str(Path(args.cwd).resolve())
     tools = list(args.tools) if args.tools else DEFAULT_TOOLS
 
-    # ── Summary header ───────────────────────────────────────────────────────
+    # -- Summary header -------------------------------------------------------
     print("\nTask      :", task)
     print("Objectives:")
     for i, o in enumerate(objectives, 1):
